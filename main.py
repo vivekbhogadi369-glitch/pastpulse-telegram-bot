@@ -5,13 +5,13 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ PastPulse Bot is working!")
+    await update.message.reply_text("✅ Bot is working perfectly!")
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
 
-    print("Bot running...")
+    print("Bot started...")
     app.run_polling()
 
 if __name__ == "__main__":
