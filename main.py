@@ -42,3 +42,4 @@ Style Rules:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I am PastPulse AI 🤖📚\nAsk any UPSC History doubt."
+    )
