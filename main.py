@@ -1,53 +1,115 @@
 import os
+import logging
+import asyncio
+
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+from openai import AsyncOpenAI
+from openai import APIConnectionError, RateLimitError, APIStatusError
+
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-from openai import OpenAI
+logger = logging.getLogger("pastpulse-bot")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ---------- Env ----------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY in environment variables.")
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=30.0, max_retries=2)
+
+
+SYSTEM_PROMPT = """You are PastPulse AI, a UPSC History assistant.
+Be accurate, crisp, and exam-oriented.
+If the user asks for '10 lines', give exactly 10 short lines.
+If asked for MCQs, provide options and explain briefly.
+"""
+
+
+# ---------- Helpers ----------
+async def ask_openai(user_text: str) -> str:
+    """
+    Calls OpenAI with retries for transient connection issues.
+    """
+    # Small manual retry loop (in addition to SDK retries)
+    for attempt in range(3):
+        try:
+            resp = await client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+
+        except APIConnectionError as e:
+            logger.warning(f"OpenAI connection error attempt {attempt+1}/3: {e}")
+            await asyncio.sleep(2 * (attempt + 1))
+
+        except RateLimitError as e:
+            logger.warning(f"Rate limited attempt {attempt+1}/3: {e}")
+            await asyncio.sleep(3 * (attempt + 1))
+
+        except APIStatusError as e:
+            # Non-connection errors with status code (e.g., 401/403/400)
+            logger.error(f"OpenAI API status error: {e.status_code} | {e.message}")
+            return "OpenAI API error (status). Please check API key/model and try again."
+
+        except Exception as e:
+            logger.exception(f"Unexpected OpenAI error: {e}")
+            return "Unexpected server error. Please try again."
+
+    return "OpenAI connection problem from server. Please retry in 30 seconds."
+
+
+# ---------- Telegram Handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "✅ PastPulse AI is Live!\nAsk any UPSC History question."
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a UPSC History expert."},
-                {"role": "user", "content": user_text},
-            ],
-        )
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
 
-        reply = response.choices[0].message.content
-        await update.message.reply_text(reply)
+    user_text = update.message.text.strip()
 
-    except Exception as e:
-        await update.message.reply_text(
-            "⚠️ OpenAI is failing. Check API key + billing."
-        )
-        print("ERROR:", e)
+    # Optional: ignore very short spam
+    if len(user_text) < 2:
+        await update.message.reply_text("Please type a proper question 🙂")
+        return
 
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    answer = await ask_openai(user_text)
+    # Telegram message limit safety
+    if len(answer) > 3500:
+        answer = answer[:3500] + "..."
+
+    await update.message.reply_text(answer)
+
+
+def main() -> None:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot running...")
-    app.run_polling()
+    logger.info("Bot started. Polling...")
+    app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
