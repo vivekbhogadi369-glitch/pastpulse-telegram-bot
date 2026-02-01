@@ -177,15 +177,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-from telegram.ext import CommandHandler, MessageHandler, filters
 
-application.add_handler(CommandHandler("uploaddoc", uploaddoc))
-application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    # Command Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("uploaddoc", uploaddoc))
 
-    logger.info("Bot started. Polling...")
-    app.run_polling(close_loop=False)
+    # Message Handlers
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    logger.info("✅ Bot started successfully...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
