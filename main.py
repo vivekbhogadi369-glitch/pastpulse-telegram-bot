@@ -35,7 +35,6 @@ if not OPENAI_API_KEY:
 if not VECTOR_STORE_ID:
     raise RuntimeError("Missing VECTOR_STORE_ID in Render env vars.")
 
-# Admin setup
 ADMIN_TELEGRAM_IDS = set(
     int(x.strip())
     for x in ADMIN_TELEGRAM_IDS_RAW.split(",")
@@ -64,43 +63,66 @@ FORMAT:
 """.strip()
 
 
-# ---------------- Admin Helper ----------------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_TELEGRAM_IDS
 
 
-# ---------------- Upload Faculty Docs ----------------
-def attach_doc_to_vector_store(local_path: str) -> str:
-    """Upload file and attach to vector store."""
+# ---------------- Upload helpers ----------------
+def upload_file_to_openai(local_path: str) -> str:
+    """Upload file to OpenAI Files and return file_id."""
     with open(local_path, "rb") as f:
         uploaded = client.files.create(file=f, purpose="assistants")
+    return uploaded.id
 
-    client.vector_stores.files.create(
-        vector_store_id=VECTOR_STORE_ID,
-        file_id=uploaded.id,
+
+def attach_file_to_vector_store(file_id: str) -> None:
+    """
+    Attach an existing OpenAI file_id to the vector store.
+    Works across multiple OpenAI SDK shapes.
+    Raises Exception if not possible.
+    """
+    # Newer SDK: client.vector_stores.files.create(...)
+    if hasattr(client, "vector_stores"):
+        client.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=file_id)
+        return
+
+    # Some SDK variants may expose it under beta
+    if hasattr(client, "beta") and hasattr(client.beta, "vector_stores"):
+        client.beta.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=file_id)
+        return
+
+    # If neither exists, we can't attach programmatically
+    raise RuntimeError(
+        "Your OpenAI SDK does not support vector store attach (no vector_stores). "
+        "Clear build cache deploy with openai==1.56.0 OR attach manually in OpenAI Dashboard."
     )
 
-    return uploaded.id
+
+def upload_and_index_doc(local_path: str) -> str:
+    """
+    Full pipeline:
+    1) upload file => file_id
+    2) attach file_id to vector store (indexing)
+    Returns file_id.
+    """
+    file_id = upload_file_to_openai(local_path)
+    attach_file_to_vector_store(file_id)
+    return file_id
 
 
 # ---------------- Docs-only Answer (Assistants API) ----------------
 def docs_only_answer_sync(user_text: str) -> str:
-    """Answer ONLY from faculty docs using Assistants API."""
-
     assistant = client.beta.assistants.create(
         name="PastPulse Faculty Docs Only",
         model="gpt-4.1-mini",
         instructions=SYSTEM_PROMPT,
         tools=[{"type": "file_search"}],
         tool_resources={
-            "file_search": {
-                "vector_store_ids": [VECTOR_STORE_ID]
-            }
+            "file_search": {"vector_store_ids": [VECTOR_STORE_ID]}
         },
     )
 
     thread = client.beta.threads.create()
-
     client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
@@ -113,13 +135,12 @@ def docs_only_answer_sync(user_text: str) -> str:
     )
 
     messages = client.beta.threads.messages.list(thread_id=thread.id)
-
     text = messages.data[0].content[0].text.value.strip()
 
-    # Hard refusal gate
     if not text:
         return REFUSAL
 
+    # Hard refusal gate: require quotes as evidence
     if ('"' not in text and "“" not in text and "”" not in text):
         return REFUSAL
 
@@ -130,7 +151,6 @@ def docs_only_answer_sync(user_text: str) -> str:
 
 
 async def docs_only_answer(user_text: str) -> str:
-    """Run sync OpenAI call safely in background thread."""
     try:
         return await asyncio.to_thread(docs_only_answer_sync, user_text)
 
@@ -160,8 +180,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
     user_text = update.message.text.strip()
-
     answer = await docs_only_answer(user_text)
 
     if len(answer) > 3900:
@@ -172,6 +193,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text(
+            "❌ Upload system not configured.\n"
+            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env vars."
+        )
+        return
 
     if not is_admin(user_id):
         await update.message.reply_text("❌ Not authorized.")
@@ -186,7 +214,17 @@ async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.document:
+        return
+
     user_id = update.effective_user.id
+
+    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text(
+            "❌ Upload system not configured.\n"
+            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env vars."
+        )
+        return
 
     if not is_admin(user_id):
         await update.message.reply_text("❌ Only faculty can upload.")
@@ -201,27 +239,41 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{doc.file_name or 'upload'}") as tmp:
             tmp_path = tmp.name
 
         await file_obj.download_to_drive(custom_path=tmp_path)
 
-        await update.message.reply_text("⏳ Uploading...")
+        await update.message.reply_text("⏳ Uploading & indexing...")
 
-        file_id = await asyncio.to_thread(attach_doc_to_vector_store, tmp_path)
+        file_id = await asyncio.to_thread(upload_and_index_doc, tmp_path)
 
-        await update.message.reply_text(f"✅ Uploaded successfully.\nFile ID: {file_id}")
+        await update.message.reply_text(f"✅ Uploaded & indexed.\nFile ID: {file_id}")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Upload failed: {e}")
+        logger.exception(e)
+        # IMPORTANT: still show file_id if upload succeeded but attach failed
+        msg = str(e)
+        await update.message.reply_text(
+            "❌ Upload failed.\n"
+            f"{msg}\n\n"
+            "If this says 'no vector_stores', do: Render → Manual Deploy → Clear build cache & deploy "
+            "and ensure requirements has openai==1.56.0."
+        )
 
     finally:
         context.user_data["awaiting_doc_upload"] = False
         if tmp_path:
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
-# ---------------- Main ----------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled Telegram error", exc_info=context.error)
+
+
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -231,8 +283,9 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("✅ PastPulse bot running...")
+    app.add_error_handler(error_handler)
 
+    logger.info("✅ PastPulse bot running (polling)...")
     app.run_polling(drop_pending_updates=True)
 
 
