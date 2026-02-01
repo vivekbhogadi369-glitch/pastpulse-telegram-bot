@@ -61,7 +61,7 @@ FORMAT (UPSC-ready):
 - Add: Timeline (5–8 points) if relevant
 - If user asks MCQs: give 4 options + answer + explanation
 - Include 1–3 short quotes from the documents as evidence.
-"""
+""".strip()
 
 # ---------------- Admin helpers ----------------
 def is_admin(user_id: int) -> bool:
@@ -73,7 +73,6 @@ def attach_doc_to_vector_store(local_path: str) -> str:
     Upload file to OpenAI Files (purpose=assistants) and attach to vector store.
     Returns uploaded OpenAI file_id.
     """
-    # Use a context manager so file handle always closes (important on Render)
     with open(local_path, "rb") as f:
         uploaded = client.files.create(file=f, purpose="assistants")
 
@@ -87,17 +86,19 @@ def attach_doc_to_vector_store(local_path: str) -> str:
 # ---------------- Docs-only answer ----------------
 def docs_only_answer_sync(user_text: str) -> str:
     """
-    Sync call to OpenAI Responses API + file_search tool bound to VECTOR_STORE_ID.
-    Hard-gates: if model doesn't quote docs, refuse (prevents hallucination).
+    OpenAI Responses API + file_search bound to VECTOR_STORE_ID.
+    IMPORTANT: Use the correct syntax (NO tool_resources kwarg).
+    Hard-gate: if the model doesn't quote docs, refuse (prevents hallucination).
     """
+
     resp = client.responses.create(
         model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text},
-        ],
-        tools=[{"type": "file_search"}],
-        tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}},
+        instructions=SYSTEM_PROMPT,
+        input=user_text,
+        tools=[{
+            "type": "file_search",
+            "vector_store_ids": [VECTOR_STORE_ID],
+        }],
     )
 
     text = (resp.output_text or "").strip()
@@ -108,7 +109,7 @@ def docs_only_answer_sync(user_text: str) -> str:
     if ('"' not in text and "“" not in text and "”" not in text and "‘" not in text and "’" not in text):
         return REFUSAL
 
-    # Also enforce exact refusal if model tries to be clever
+    # If model tries to include refusal inside longer text, force exact refusal
     if "Not found in faculty documents" in text:
         return REFUSAL
 
@@ -117,8 +118,8 @@ def docs_only_answer_sync(user_text: str) -> str:
 
 async def docs_only_answer(user_text: str) -> str:
     """
-    Run the sync OpenAI call in a thread to keep Telegram async loop responsive.
-    Includes basic retry for transient errors.
+    Run the sync OpenAI call in a thread (keeps Telegram async loop responsive).
+    Retries for transient errors.
     """
     for attempt in range(3):
         try:
@@ -133,9 +134,8 @@ async def docs_only_answer(user_text: str) -> str:
             await asyncio.sleep(3 * (attempt + 1))
 
         except APIStatusError as e:
-            # Useful message for debugging wrong model/vector store etc.
             logger.error(f"OpenAI API status error: {getattr(e, 'status_code', 'unknown')} | {str(e)}")
-            return "OpenAI API error. Please check API key, model access, and VECTOR_STORE_ID."
+            return "OpenAI API error. Please check model access and VECTOR_STORE_ID."
 
         except Exception as e:
             logger.exception(f"Unexpected error: {e}")
@@ -157,6 +157,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_text = update.message.text.strip()
+
     if len(user_text) < 2:
         await update.message.reply_text("Please type a proper question 🙂")
         return
@@ -215,10 +216,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     doc = update.message.document
-
-    # Optional: Basic file-type guard (still allows all if you prefer)
     filename = (doc.file_name or "").lower()
     allowed = (".pdf", ".doc", ".docx", ".txt")
+
     if filename and not filename.endswith(allowed):
         context.user_data["awaiting_doc_upload"] = False
         await update.message.reply_text("❌ Please upload PDF/DOC/DOCX/TXT only.")
@@ -252,6 +252,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 pass
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Prevent silent crashes; keeps details in Render logs
+    logger.exception("Unhandled Telegram error", exc_info=context.error)
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -265,8 +270,14 @@ def main() -> None:
     # Student Q&A (text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("✅ Bot started successfully...")
-    app.run_polling()
+    # Error handler (so bot doesn't die silently)
+    app.add_error_handler(error_handler)
+
+    logger.info("✅ Bot started successfully (polling)...")
+
+    # IMPORTANT: clears old queued updates and reduces weirdness after redeploy
+    # NOTE: This does NOT fix Conflict if another instance is running elsewhere.
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
