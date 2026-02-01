@@ -1,4 +1,13 @@
 import os
+
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
+ADMIN_TELEGRAM_IDS = set(
+    int(x.strip()) for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip().isdigit()
+)
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_TELEGRAM_IDS
+import os
 import logging
 import asyncio
 
