@@ -4,7 +4,13 @@ import tempfile
 import asyncio
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 from openai import OpenAI
 from openai import APIConnectionError, RateLimitError, APIStatusError
@@ -21,20 +27,15 @@ VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "").strip()
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "").strip()
 ADMIN_TELEGRAM_IDS_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "").strip()
 
-# Hard required env vars (bot must not start without them)
+# Required env vars
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in Render env vars.")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY in environment variables.")
+    raise RuntimeError("Missing OPENAI_API_KEY in Render env vars.")
 if not VECTOR_STORE_ID:
-    raise RuntimeError("Missing VECTOR_STORE_ID in environment variables.")
+    raise RuntimeError("Missing VECTOR_STORE_ID in Render env vars.")
 
-# Admin vars: required if you want uploads to work securely
-if not ADMIN_SECRET:
-    logger.warning("ADMIN_SECRET is missing. Faculty upload command will NOT work securely.")
-if not ADMIN_TELEGRAM_IDS_RAW:
-    logger.warning("ADMIN_TELEGRAM_IDS is missing. No one will be authorized to upload documents.")
-
+# Admin setup
 ADMIN_TELEGRAM_IDS = set(
     int(x.strip())
     for x in ADMIN_TELEGRAM_IDS_RAW.split(",")
@@ -48,68 +49,80 @@ REFUSAL = "Not found in faculty documents. Ask faculty to upload the relevant ma
 SYSTEM_PROMPT = """
 You are PastPulse AI (UPSC History tutor).
 
-STRICT RULES (NON-NEGOTIABLE):
+STRICT RULES:
 - Answer ONLY from faculty documents retrieved via file_search.
-- If the answer is not present in the documents, reply exactly:
+- If answer not present, reply exactly:
 Not found in faculty documents. Ask faculty to upload the relevant material.
-- Do NOT use outside knowledge. Do NOT guess.
+- Do NOT guess. Do NOT use outside knowledge.
 
-FORMAT (UPSC-ready):
-- Use headings + bullet points
-- If user asks “150 words” or “250 words”, follow it
-- Add: Keywords (5–10)
-- Add: Timeline (5–8 points) if relevant
-- If user asks MCQs: give 4 options + answer + explanation
-- Include 1–3 short quotes from the documents as evidence.
+FORMAT:
+- UPSC style headings + bullets
+- Add Keywords (5–10)
+- Add Timeline if relevant
+- If MCQs: 4 options + answer + explanation
+- Include 1–2 short quotes from documents.
 """.strip()
 
-# ---------------- Admin helpers ----------------
+
+# ---------------- Admin Helper ----------------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_TELEGRAM_IDS
 
 
+# ---------------- Upload Faculty Docs ----------------
 def attach_doc_to_vector_store(local_path: str) -> str:
-    """
-    Upload file to OpenAI Files (purpose=assistants) and attach to vector store.
-    Returns uploaded OpenAI file_id.
-    """
+    """Upload file and attach to vector store."""
     with open(local_path, "rb") as f:
         uploaded = client.files.create(file=f, purpose="assistants")
 
     client.vector_stores.files.create(
         vector_store_id=VECTOR_STORE_ID,
-        file_id=uploaded.id
+        file_id=uploaded.id,
     )
+
     return uploaded.id
 
 
-# ---------------- Docs-only answer ----------------
+# ---------------- Docs-only Answer (Assistants API) ----------------
 def docs_only_answer_sync(user_text: str) -> str:
-    """
-    OpenAI Responses API + file_search bound to VECTOR_STORE_ID.
-    IMPORTANT: Use the correct syntax (NO tool_resources kwarg).
-    Hard-gate: if the model doesn't quote docs, refuse (prevents hallucination).
-    """
+    """Answer ONLY from faculty docs using Assistants API."""
 
-    resp = client.responses.create(
+    assistant = client.beta.assistants.create(
+        name="PastPulse Faculty Docs Only",
         model="gpt-4.1-mini",
         instructions=SYSTEM_PROMPT,
-        input=user_text,
-        tools=[{
-            "type": "file_search",
-            "vector_store_ids": [VECTOR_STORE_ID],
-        }],
+        tools=[{"type": "file_search"}],
+        tool_resources={
+            "file_search": {
+                "vector_store_ids": [VECTOR_STORE_ID]
+            }
+        },
     )
 
-    text = (resp.output_text or "").strip()
+    thread = client.beta.threads.create()
+
+    client.beta.threads.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=user_text,
+    )
+
+    client.beta.threads.runs.create_and_poll(
+        thread_id=thread.id,
+        assistant_id=assistant.id,
+    )
+
+    messages = client.beta.threads.messages.list(thread_id=thread.id)
+
+    text = messages.data[0].content[0].text.value.strip()
+
+    # Hard refusal gate
     if not text:
         return REFUSAL
 
-    # HARD GATE: No quote marks => refuse (forces evidence)
-    if ('"' not in text and "“" not in text and "”" not in text and "‘" not in text and "’" not in text):
+    if ('"' not in text and "“" not in text and "”" not in text):
         return REFUSAL
 
-    # If model tries to include refusal inside longer text, force exact refusal
     if "Not found in faculty documents" in text:
         return REFUSAL
 
@@ -117,166 +130,109 @@ def docs_only_answer_sync(user_text: str) -> str:
 
 
 async def docs_only_answer(user_text: str) -> str:
-    """
-    Run the sync OpenAI call in a thread (keeps Telegram async loop responsive).
-    Retries for transient errors.
-    """
-    for attempt in range(3):
-        try:
-            return await asyncio.to_thread(docs_only_answer_sync, user_text)
+    """Run sync OpenAI call safely in background thread."""
+    try:
+        return await asyncio.to_thread(docs_only_answer_sync, user_text)
 
-        except APIConnectionError as e:
-            logger.warning(f"OpenAI connection error attempt {attempt+1}/3: {e}")
-            await asyncio.sleep(2 * (attempt + 1))
+    except APIConnectionError:
+        return "⚠️ OpenAI connection error. Try again."
 
-        except RateLimitError as e:
-            logger.warning(f"Rate limited attempt {attempt+1}/3: {e}")
-            await asyncio.sleep(3 * (attempt + 1))
+    except RateLimitError:
+        return "⚠️ Too many requests. Try again after 1 minute."
 
-        except APIStatusError as e:
-            logger.error(f"OpenAI API status error: {getattr(e, 'status_code', 'unknown')} | {str(e)}")
-            return "OpenAI API error. Please check model access and VECTOR_STORE_ID."
+    except APIStatusError as e:
+        return f"⚠️ OpenAI API error: {e}"
 
-        except Exception as e:
-            logger.exception(f"Unexpected error: {e}")
-            return "Unexpected server error. Please try again."
-
-    return "OpenAI connection problem from server. Please retry in 30 seconds."
+    except Exception as e:
+        logger.exception(e)
+        return "Unexpected server error. Please try again."
 
 
 # ---------------- Telegram Handlers ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ PastPulse AI is Live!\nAsk any UPSC History question.\n\n"
-        "Faculty: use /uploaddoc <ADMIN_SECRET> then send PDF/DOC to add notes."
+        "✅ PastPulse AI is Live!\n"
+        "Ask any UPSC History question.\n\n"
+        "Faculty Upload:\n"
+        "/uploaddoc <ADMIN_SECRET>\n"
+        "Then send PDF/DOC."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
-
-    if len(user_text) < 2:
-        await update.message.reply_text("Please type a proper question 🙂")
-        return
 
     answer = await docs_only_answer(user_text)
 
-    # Telegram message limit safety (~4096). Keep buffer.
     if len(answer) > 3900:
         answer = answer[:3900] + "…"
 
     await update.message.reply_text(answer)
 
 
-async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
-        await update.message.reply_text(
-            "❌ Upload system is not configured.\n"
-            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env variables."
-        )
-        return
-
     if not is_admin(user_id):
-        await update.message.reply_text("❌ You are not authorized to upload documents.")
+        await update.message.reply_text("❌ Not authorized.")
         return
 
-    # /uploaddoc <ADMIN_SECRET>
     if len(context.args) != 1 or context.args[0] != ADMIN_SECRET:
-        await update.message.reply_text("❌ Use:\n/uploaddoc <ADMIN_SECRET>\nThen send the PDF/DOC.")
+        await update.message.reply_text("❌ Use:\n/uploaddoc <ADMIN_SECRET>")
         return
 
     context.user_data["awaiting_doc_upload"] = True
-    await update.message.reply_text("✅ Now send the PDF/DOC file. I will add it to the faculty knowledge base.")
+    await update.message.reply_text("✅ Now send the PDF/DOC file.")
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.document:
-        return
-
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
-        await update.message.reply_text(
-            "❌ Upload system is not configured.\n"
-            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env variables."
-        )
-        return
-
     if not is_admin(user_id):
-        await update.message.reply_text("❌ Only faculty/admin can upload documents.")
+        await update.message.reply_text("❌ Only faculty can upload.")
         return
 
     if not context.user_data.get("awaiting_doc_upload"):
-        await update.message.reply_text("Send /uploaddoc <ADMIN_SECRET> first, then send the file.")
+        await update.message.reply_text("Send /uploaddoc <ADMIN_SECRET> first.")
         return
 
     doc = update.message.document
-    filename = (doc.file_name or "").lower()
-    allowed = (".pdf", ".doc", ".docx", ".txt")
-
-    if filename and not filename.endswith(allowed):
-        context.user_data["awaiting_doc_upload"] = False
-        await update.message.reply_text("❌ Please upload PDF/DOC/DOCX/TXT only.")
-        return
-
     file_obj = await context.bot.get_file(doc.file_id)
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{doc.file_name or 'upload'}") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp_path = tmp.name
 
         await file_obj.download_to_drive(custom_path=tmp_path)
 
-        await update.message.reply_text("⏳ Uploading to faculty knowledge base…")
+        await update.message.reply_text("⏳ Uploading...")
 
         file_id = await asyncio.to_thread(attach_doc_to_vector_store, tmp_path)
 
-        await update.message.reply_text(f"✅ Uploaded & indexed.\nFile ID: {file_id}")
+        await update.message.reply_text(f"✅ Uploaded successfully.\nFile ID: {file_id}")
 
     except Exception as e:
-        logger.exception(f"Upload failed: {e}")
         await update.message.reply_text(f"❌ Upload failed: {e}")
 
     finally:
         context.user_data["awaiting_doc_upload"] = False
         if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+            os.remove(tmp_path)
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Prevent silent crashes; keeps details in Render logs
-    logger.exception("Unhandled Telegram error", exc_info=context.error)
-
-
-def main() -> None:
+# ---------------- Main ----------------
+def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("uploaddoc", uploaddoc))
 
-    # Faculty upload handler (documents)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    # Student Q&A (text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Error handler (so bot doesn't die silently)
-    app.add_error_handler(error_handler)
+    logger.info("✅ PastPulse bot running...")
 
-    logger.info("✅ Bot started successfully (polling)...")
-
-    # IMPORTANT: clears old queued updates and reduces weirdness after redeploy
-    # NOTE: This does NOT fix Conflict if another instance is running elsewhere.
     app.run_polling(drop_pending_updates=True)
 
 
