@@ -47,7 +47,7 @@ def attach_doc_to_vector_store(local_path: str) -> str:
     client.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=f.id)
     return f.id
     async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+        user_id = update.effective_user.id
 
     if not is_admin(user_id):
         await update.message.reply_text("❌ You are not authorized.")
@@ -64,7 +64,7 @@ def attach_doc_to_vector_store(local_path: str) -> str:
         "✅ Now send the PDF/DOC file. I will upload it."
     )
     async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+        user_id = update.effective_user.id
 
     if not is_admin(user_id):
         await update.message.reply_text("❌ Only faculty/admin can upload documents.")
