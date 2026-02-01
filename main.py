@@ -1,11 +1,11 @@
 import os
 import logging
 import tempfile
-import time
 import asyncio
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
 from openai import OpenAI
 from openai import APIConnectionError, RateLimitError, APIStatusError
 
@@ -14,23 +14,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- Env Vars ----------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "").strip()
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
-ADMIN_TELEGRAM_IDS = set(
-    int(x.strip())
-    for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",")
-    if x.strip().isdigit()
-)
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "").strip()
+ADMIN_TELEGRAM_IDS_RAW = os.environ.get("ADMIN_TELEGRAM_IDS", "").strip()
 
+# Hard required env vars (bot must not start without them)
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY in environment variables.")
 if not VECTOR_STORE_ID:
     raise RuntimeError("Missing VECTOR_STORE_ID in environment variables.")
+
+# Admin vars: required if you want uploads to work securely
+if not ADMIN_SECRET:
+    logger.warning("ADMIN_SECRET is missing. Faculty upload command will NOT work securely.")
+if not ADMIN_TELEGRAM_IDS_RAW:
+    logger.warning("ADMIN_TELEGRAM_IDS is missing. No one will be authorized to upload documents.")
+
+ADMIN_TELEGRAM_IDS = set(
+    int(x.strip())
+    for x in ADMIN_TELEGRAM_IDS_RAW.split(",")
+    if x.strip().isdigit()
+)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -64,8 +73,14 @@ def attach_doc_to_vector_store(local_path: str) -> str:
     Upload file to OpenAI Files (purpose=assistants) and attach to vector store.
     Returns uploaded OpenAI file_id.
     """
-    uploaded = client.files.create(file=open(local_path, "rb"), purpose="assistants")
-    client.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=uploaded.id)
+    # Use a context manager so file handle always closes (important on Render)
+    with open(local_path, "rb") as f:
+        uploaded = client.files.create(file=f, purpose="assistants")
+
+    client.vector_stores.files.create(
+        vector_store_id=VECTOR_STORE_ID,
+        file_id=uploaded.id
+    )
     return uploaded.id
 
 
@@ -86,12 +101,18 @@ def docs_only_answer_sync(user_text: str) -> str:
     )
 
     text = (resp.output_text or "").strip()
-
-    # HARD GATE: If no evidence quote marks, refuse
-    if ('"' not in text and "“" not in text and "”" not in text):
+    if not text:
         return REFUSAL
 
-    return text if text else REFUSAL
+    # HARD GATE: No quote marks => refuse (forces evidence)
+    if ('"' not in text and "“" not in text and "”" not in text and "‘" not in text and "’" not in text):
+        return REFUSAL
+
+    # Also enforce exact refusal if model tries to be clever
+    if "Not found in faculty documents" in text:
+        return REFUSAL
+
+    return text
 
 
 async def docs_only_answer(user_text: str) -> str:
@@ -112,8 +133,9 @@ async def docs_only_answer(user_text: str) -> str:
             await asyncio.sleep(3 * (attempt + 1))
 
         except APIStatusError as e:
-            logger.error(f"OpenAI API status error: {e.status_code} | {getattr(e, 'message', str(e))}")
-            return "OpenAI API error. Please check API key/model/vector store and try again."
+            # Useful message for debugging wrong model/vector store etc.
+            logger.error(f"OpenAI API status error: {getattr(e, 'status_code', 'unknown')} | {str(e)}")
+            return "OpenAI API error. Please check API key, model access, and VECTOR_STORE_ID."
 
         except Exception as e:
             logger.exception(f"Unexpected error: {e}")
@@ -124,7 +146,10 @@ async def docs_only_answer(user_text: str) -> str:
 
 # ---------------- Telegram Handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("✅ PastPulse AI is Live!\nAsk any UPSC History question.")
+    await update.message.reply_text(
+        "✅ PastPulse AI is Live!\nAsk any UPSC History question.\n\n"
+        "Faculty: use /uploaddoc <ADMIN_SECRET> then send PDF/DOC to add notes."
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -138,15 +163,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     answer = await docs_only_answer(user_text)
 
-    # Telegram message limit safety
-    if len(answer) > 3500:
-        answer = answer[:3500] + "..."
+    # Telegram message limit safety (~4096). Keep buffer.
+    if len(answer) > 3900:
+        answer = answer[:3900] + "…"
 
     await update.message.reply_text(answer)
 
 
 async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
+    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text(
+            "❌ Upload system is not configured.\n"
+            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env variables."
+        )
+        return
 
     if not is_admin(user_id):
         await update.message.reply_text("❌ You are not authorized to upload documents.")
@@ -162,7 +194,17 @@ async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.document:
+        return
+
     user_id = update.effective_user.id
+
+    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
+        await update.message.reply_text(
+            "❌ Upload system is not configured.\n"
+            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env variables."
+        )
+        return
 
     if not is_admin(user_id):
         await update.message.reply_text("❌ Only faculty/admin can upload documents.")
@@ -173,38 +215,54 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     doc = update.message.document
+
+    # Optional: Basic file-type guard (still allows all if you prefer)
+    filename = (doc.file_name or "").lower()
+    allowed = (".pdf", ".doc", ".docx", ".txt")
+    if filename and not filename.endswith(allowed):
+        context.user_data["awaiting_doc_upload"] = False
+        await update.message.reply_text("❌ Please upload PDF/DOC/DOCX/TXT only.")
+        return
+
     file_obj = await context.bot.get_file(doc.file_id)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{doc.file_name}") as tmp:
-        tmp_path = tmp.name
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{doc.file_name or 'upload'}") as tmp:
+            tmp_path = tmp.name
+
         await file_obj.download_to_drive(custom_path=tmp_path)
 
-    await update.message.reply_text("⏳ Uploading to faculty knowledge base…")
+        await update.message.reply_text("⏳ Uploading to faculty knowledge base…")
 
-    try:
         file_id = await asyncio.to_thread(attach_doc_to_vector_store, tmp_path)
+
         await update.message.reply_text(f"✅ Uploaded & indexed.\nFile ID: {file_id}")
+
     except Exception as e:
+        logger.exception(f"Upload failed: {e}")
         await update.message.reply_text(f"❌ Upload failed: {e}")
+
     finally:
         context.user_data["awaiting_doc_upload"] = False
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Command handlers
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("uploaddoc", uploaddoc))
 
-    # File handler (faculty uploads)
+    # Faculty upload handler (documents)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Text handler (students questions)
+    # Student Q&A (text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("✅ Bot started successfully...")
