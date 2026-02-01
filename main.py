@@ -37,7 +37,59 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY in environment variables.")
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=30.0, max_retries=2)
+from openai import OpenAI
 
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+VECTOR_STORE_ID = os.environ["VECTOR_STORE_ID"]
+
+def attach_doc_to_vector_store(local_path: str) -> str:
+    f = client.files.create(file=open(local_path, "rb"), purpose="assistants")
+    client.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=f.id)
+    return f.id
+    async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You are not authorized.")
+        return
+
+    if len(context.args) != 1 or context.args[0] != ADMIN_SECRET:
+        await update.message.reply_text(
+            "❌ Use:\n/uploaddoc <ADMIN_SECRET>\nThen send the PDF."
+        )
+        return
+
+    context.user_data["awaiting_doc_upload"] = True
+    await update.message.reply_text(
+        "✅ Now send the PDF/DOC file. I will upload it."
+    )
+    async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Only faculty/admin can upload documents.")
+        return
+
+    if not context.user_data.get("awaiting_doc_upload"):
+        await update.message.reply_text("Send /uploaddoc <ADMIN_SECRET> first, then send the file.")
+        return
+
+    doc = update.message.document
+    file_obj = await context.bot.get_file(doc.file_id)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{doc.file_name}") as tmp:
+        tmp_path = tmp.name
+        await file_obj.download_to_drive(custom_path=tmp_path)
+
+    await update.message.reply_text("⏳ Uploading to faculty knowledge base…")
+
+    try:
+        file_id = attach_doc_to_vector_store(tmp_path)
+        await update.message.reply_text(f"✅ Uploaded & indexed.\nFile ID: {file_id}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Upload failed: {e}")
+    finally:
+        context.user_data["awaiting_doc_upload"] = False
 
 SYSTEM_PROMPT = """
 You are PastPulse AI — a UPSC History mentor.
@@ -125,7 +177,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+from telegram.ext import CommandHandler, MessageHandler, filters
 
+application.add_handler(CommandHandler("uploaddoc", uploaddoc))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
