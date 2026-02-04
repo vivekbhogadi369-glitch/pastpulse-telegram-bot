@@ -1,7 +1,9 @@
 import os
+import re
 import logging
 import tempfile
 import asyncio
+from typing import List
 
 from telegram import Update
 from telegram.ext import (
@@ -190,35 +192,14 @@ B) Estimated Score (Approximate)
    - Add: "This is an estimated, approximate score — not an official UPSC marking."
 
 C) What is GOOD (Strengths)
-   - Content accuracy
-   - Structure and coherence
-   - Historical depth
-   - Use of examples/evidence
-   - Multi-dimensionality (if present)
 
 D) What is MISSING / WEAK (Gaps)
-   - Lack of analysis
-   - Poor chronology
-   - Missing keywords/examples
-   - Weak linkage to directive (critically examine, discuss, analyse)
-   - Overgeneralization or factual risk
 
 E) What is BAD (Critical faults, if any)
-   - Irrelevant content
-   - Non-historical digressions
-   - Incorrect factual claims (flag clearly)
 
 F) UPSC-Level Improvements (Actionable Tips)
-   - How to enrich intro/body/conclusion
-   - Add 2–3 dimensions (political, socio-economic, cultural, ideological)
-   - Add a mini timeline/diagram suggestion
-   - Strengthen conclusion with historical linkage
 
 G) Value Addition (Rewrite Add-on)
-   - Provide 5–7 high-quality points the student should insert
-   - Provide 5–10 keywords
-   - Provide 1 small timeline or ASCII schematic
-   - Optional: improved intro + improved conclusion (2–3 lines each)
 
 Strict Rule:
 - Evaluate ONLY GS-1 History/Art & Culture answers.
@@ -233,6 +214,77 @@ Strict Rule:
 - Prefer structured bullets over long paragraphs.
 - Ask only ONE clarifying question if needed (within GS-1 scope).
 """.strip()
+
+# ---------------- Utilities: query wrapping + detectors ----------------
+def wrap_user_query(user_text: str) -> str:
+    """
+    Hard-pin output format every time (prevents 'simple paragraph' answers).
+    This is sent as the USER message content into the assistant thread.
+    """
+    return f"""
+Follow these operating rules STRICTLY:
+1) Only GS-1 History + Indian Art & Culture.
+2) Use ONLY faculty documents via file_search. No outside knowledge.
+3) If not supported by faculty documents, reply EXACTLY: {REFUSAL}
+4) For factual/content answers, include at least ONE short direct quote (1–2 lines) from the faculty documents.
+5) If question asks 150/250 words or is MAINS-style → MUST output:
+   - Introduction
+   - Body (analytical subheadings)
+   - Conclusion
+   - Chronological Timeline (5–10 bullets)
+   - Conceptual Mindmap (ASCII)
+   - High-Value Keywords (8–15)
+   - PYQ Frequency Band (High/Medium/Low) without inventing years
+6) If user asks MCQs → follow UPSC Prelims format with Answer Key + elimination for each wrong option.
+
+User question:
+{user_text}
+""".strip()
+
+
+def is_mcq_request(user_text: str) -> bool:
+    t = user_text.lower()
+    return any(k in t for k in ["mcq", "mcqs", "multiple choice", "prelims", "objective", "choose the correct"])
+
+
+def is_mains_request(user_text: str) -> bool:
+    t = user_text.lower()
+    if re.search(r"\b(150|250)\b", t):
+        return True
+    if "mains" in t:
+        return True
+    # Common mains directives
+    return any(k in t for k in ["discuss", "analyse", "analyze", "critically", "examine", "comment", "elucidate", "explain"])
+
+
+def looks_like_mains_pack(text: str) -> bool:
+    t = text.lower()
+    must = ["introduction", "conclusion", "timeline", "mindmap", "keywords", "pyq frequency"]
+    return all(m in t for m in must)
+
+
+def split_telegram_chunks(text: str, limit: int = 3900) -> List[str]:
+    """
+    Telegram hard limit ~4096. Use 3900 to be safe.
+    Splits on paragraph boundaries where possible.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    parts = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut == -1 or cut < 800:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut == -1 or cut < 800:
+            cut = limit
+        parts.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
 
 # ---------------- Admin check ----------------
 def is_admin(user_id: int) -> bool:
@@ -253,17 +305,14 @@ def attach_file_to_vector_store(file_id: str) -> None:
     Works across multiple OpenAI SDK shapes.
     Raises Exception if not possible.
     """
-    # Newer SDK: client.vector_stores.files.create(...)
     if hasattr(client, "vector_stores"):
         client.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=file_id)
         return
 
-    # Some SDK variants may expose it under beta
     if hasattr(client, "beta") and hasattr(client.beta, "vector_stores"):
         client.beta.vector_stores.files.create(vector_store_id=VECTOR_STORE_ID, file_id=file_id)
         return
 
-    # If neither exists, we can't attach programmatically
     raise RuntimeError(
         "Your OpenAI SDK does not support vector store attach (no vector_stores). "
         "Clear build cache deploy with openai==1.56.0 OR attach manually in OpenAI Dashboard."
@@ -271,19 +320,12 @@ def attach_file_to_vector_store(file_id: str) -> None:
 
 
 def upload_and_index_doc(local_path: str) -> str:
-    """
-    Full pipeline:
-    1) upload file => file_id
-    2) attach file_id to vector store (indexing)
-    Returns file_id.
-    """
     file_id = upload_file_to_openai(local_path)
     attach_file_to_vector_store(file_id)
     return file_id
 
 
 # ---------------- Docs-only Answer (Assistants API) ----------------
-# Cache the assistant so we don't create a new one on every message.
 _ASSISTANT_ID = None
 
 
@@ -292,25 +334,30 @@ def _get_or_create_assistant_id() -> str:
     if _ASSISTANT_ID:
         return _ASSISTANT_ID
 
+    # IMPORTANT: upgrade model for better instruction-following + UPSC formatting
     assistant = client.beta.assistants.create(
         name="PastPulse Faculty Docs Only",
-        model="gpt-4.1-mini",
+        model="gpt-4.1",
         instructions=SYSTEM_PROMPT,
         tools=[{"type": "file_search"}],
         tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}},
     )
     _ASSISTANT_ID = assistant.id
+    logger.info("Created Assistant: ASSISTANT_ID=%s VECTOR_STORE_ID=%s", _ASSISTANT_ID, VECTOR_STORE_ID)
     return _ASSISTANT_ID
 
 
-def docs_only_answer_sync(user_text: str) -> str:
+def _assistant_run(user_content: str) -> str:
+    """
+    One assistant run using file_search vector store.
+    """
     assistant_id = _get_or_create_assistant_id()
 
     thread = client.beta.threads.create()
     client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
-        content=user_text,
+        content=user_content,
     )
 
     client.beta.threads.runs.create_and_poll(
@@ -320,23 +367,68 @@ def docs_only_answer_sync(user_text: str) -> str:
 
     messages = client.beta.threads.messages.list(thread_id=thread.id)
     text = messages.data[0].content[0].text.value.strip() if messages.data else ""
+    return text
+
+
+def docs_only_answer_sync(user_text: str) -> str:
+    # Always wrap to pin UPSC output format
+    wrapped = wrap_user_query(user_text)
+
+    # --- Primary run ---
+    text = _assistant_run(wrapped)
+    logger.info("RAW_OUTPUT_HEAD=%s", (text[:600] if text else "").replace("\n", "\\n"))
 
     if not text:
         return REFUSAL
 
-    # If assistant explicitly returns refusal phrase, enforce it
+    # Enforce refusal phrase if assistant used it
     if REFUSAL in text:
         return REFUSAL
 
     # Gatekeeping:
-    # - Normal factual answers must include at least one quote from docs.
-    # - BUT evaluation mode is allowed without quotes (it should contain "Estimated Score:")
+    # - evaluation mode allowed without quotes
     is_evaluation = ("Estimated Score:" in text)
 
     if not is_evaluation:
         has_quote = ('"' in text) or ("“" in text) or ("”" in text)
         if not has_quote:
             return REFUSAL
+
+    # --- UPSC format enforcement (second pass, still via assistant + file_search) ---
+    # Only for MAINS-type questions (NOT MCQs), and only if the answer lacks the full pack.
+    if (not is_mcq_request(user_text)) and is_mains_request(user_text) and (not is_evaluation):
+        if not looks_like_mains_pack(text):
+            reform_request = f"""
+Reformat the following answer into the mandated UPSC MAINS ENRICHMENT PACK structure:
+- Introduction
+- Body (analytical subheadings)
+- Conclusion
+- Chronological Timeline (5–10 bullets)
+- Conceptual Mindmap (ASCII)
+- High-Value Keywords (8–15)
+- PYQ Frequency Band (High/Medium/Low) without inventing years
+
+CRITICAL CONSTRAINTS:
+- Do NOT add any new facts beyond what is already present OR what is retrieved from faculty documents.
+- Use ONLY faculty documents via file_search.
+- Include at least ONE short direct quote (1–2 lines) as evidence.
+- If not supported, reply EXACTLY: {REFUSAL}
+
+TEXT TO REFORMAT:
+{text}
+""".strip()
+
+            text2 = _assistant_run(reform_request)
+            logger.info("REFORMAT_OUTPUT_HEAD=%s", (text2[:600] if text2 else "").replace("\n", "\\n"))
+
+            if text2 and (REFUSAL not in text2):
+                # Maintain quote gate
+                if ('"' in text2) or ("“" in text2) or ("”" in text2):
+                    text = text2
+                else:
+                    return REFUSAL
+            elif text2 and (REFUSAL in text2):
+                return REFUSAL
 
     return text
 
@@ -379,11 +471,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     answer = await docs_only_answer(user_text)
 
-    # Telegram safe length
-    if len(answer) > 3900:
-        answer = answer[:3900] + "…"
-
-    await update.message.reply_text(answer)
+    # Send in chunks (do NOT truncate)
+    for part in split_telegram_chunks(answer, limit=3900):
+        await update.message.reply_text(part)
 
 
 async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
