@@ -3,7 +3,7 @@ import re
 import logging
 import tempfile
 import asyncio
-from typing import List
+from typing import List, Optional, Tuple
 
 from telegram import Update
 from telegram.ext import (
@@ -16,6 +16,13 @@ from telegram.ext import (
 
 from openai import OpenAI
 from openai import APIConnectionError, RateLimitError, APIStatusError
+
+# --- PDF/OCR ---
+import pdfplumber
+from pdf2image import convert_from_path
+from PIL import Image
+import pytesseract
+
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -215,6 +222,36 @@ Strict Rule:
 - Ask only ONE clarifying question if needed (within GS-1 scope).
 """.strip()
 
+# ---------------- Evaluation-only system prompt (NO DOCS; UPSC Rubric Only) ----------------
+EVAL_SYSTEM_PROMPT = """
+You are a strict UPSC GS-1 examiner and mentor.
+
+You ONLY evaluate answers that belong to GS-1 History & Indian Art and Culture
+(Ancient/Medieval/Modern Indian History, prescribed World History themes, Post-Independence as historical processes, Indian Art & Culture).
+If the answer is clearly not from GS-1 History/Art & Culture, refuse:
+
+"Refusal (Out of GS-1 History/Art & Culture): I can’t evaluate this because it is not GS-1 History/Art & Culture."
+
+Evaluation format (MANDATORY):
+A) Overall Examiner Impression (1–2 lines)
+B) Estimated Score: X / MAX
+   - Add: "This is an estimated, approximate score — not an official UPSC marking."
+C) What is GOOD (Strengths) (bullets)
+D) What is MISSING / WEAK (Gaps) (bullets)
+E) What is BAD (Critical faults, if any) (bullets)
+F) UPSC-Level Improvements (Actionable tips) (bullets)
+G) Value Addition (Rewrite Add-on)
+   - Provide a rewritten improved answer in UPSC style within the expected word limit for the marker.
+
+Marker mapping:
+- 10 marker ≈ 150 words
+- 15 marker ≈ 250 words
+- 20 marker ≈ 350–400 words
+
+Tone: strict, examiner-like. No fluff.
+""".strip()
+
+
 # ---------------- Utilities: query wrapping + detectors ----------------
 def wrap_user_query(user_text: str) -> str:
     """
@@ -291,7 +328,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_TELEGRAM_IDS
 
 
-# ---------------- Upload helpers ----------------
+# ---------------- Upload helpers (Faculty docs) ----------------
 def upload_file_to_openai(local_path: str) -> str:
     """Upload file to OpenAI Files and return file_id."""
     with open(local_path, "rb") as f:
@@ -334,7 +371,6 @@ def _get_or_create_assistant_id() -> str:
     if _ASSISTANT_ID:
         return _ASSISTANT_ID
 
-    # IMPORTANT: upgrade model for better instruction-following + UPSC formatting
     assistant = client.beta.assistants.create(
         name="PastPulse Faculty Docs Only",
         model="gpt-4.1",
@@ -348,9 +384,6 @@ def _get_or_create_assistant_id() -> str:
 
 
 def _assistant_run(user_content: str) -> str:
-    """
-    One assistant run using file_search vector store.
-    """
     assistant_id = _get_or_create_assistant_id()
 
     thread = client.beta.threads.create()
@@ -371,32 +404,25 @@ def _assistant_run(user_content: str) -> str:
 
 
 def docs_only_answer_sync(user_text: str) -> str:
-    # Always wrap to pin UPSC output format
     wrapped = wrap_user_query(user_text)
 
-    # --- Primary run ---
     text = _assistant_run(wrapped)
     logger.info("RAW_OUTPUT_HEAD=%s", (text[:600] if text else "").replace("\n", "\\n"))
 
     if not text:
         return REFUSAL
 
-    # Enforce refusal phrase if assistant used it
     if REFUSAL in text:
         return REFUSAL
 
-    # Gatekeeping:
-    # - evaluation mode allowed without quotes
-    is_evaluation = ("Estimated Score:" in text)
+    # Gatekeeping for docs-only outputs:
+    # Must contain a quote to prove retrieval happened (unless evaluation mode, but eval is handled separately now).
+    has_quote = ('"' in text) or ("“" in text) or ("”" in text)
+    if not has_quote:
+        return REFUSAL
 
-    if not is_evaluation:
-        has_quote = ('"' in text) or ("“" in text) or ("”" in text)
-        if not has_quote:
-            return REFUSAL
-
-    # --- UPSC format enforcement (second pass, still via assistant + file_search) ---
-    # Only for MAINS-type questions (NOT MCQs), and only if the answer lacks the full pack.
-    if (not is_mcq_request(user_text)) and is_mains_request(user_text) and (not is_evaluation):
+    # UPSC MAINS enforcement second pass (only for mains-type, not MCQs)
+    if (not is_mcq_request(user_text)) and is_mains_request(user_text):
         if not looks_like_mains_pack(text):
             reform_request = f"""
 Reformat the following answer into the mandated UPSC MAINS ENRICHMENT PACK structure:
@@ -422,8 +448,8 @@ TEXT TO REFORMAT:
             logger.info("REFORMAT_OUTPUT_HEAD=%s", (text2[:600] if text2 else "").replace("\n", "\\n"))
 
             if text2 and (REFUSAL not in text2):
-                # Maintain quote gate
-                if ('"' in text2) or ("“" in text2) or ("”" in text2):
+                has_quote2 = ('"' in text2) or ("“" in text2) or ("”" in text2)
+                if has_quote2:
                     text = text2
                 else:
                     return REFUSAL
@@ -451,13 +477,167 @@ async def docs_only_answer(user_text: str) -> str:
         return "Unexpected server error. Please try again."
 
 
+# ---------------- Evaluation detection + marker parsing ----------------
+EVAL_PAT = re.compile(r"\bevaluate\s+my\s+(answer|pdf)\b", re.IGNORECASE)
+
+
+def is_evaluation_request(text: str) -> bool:
+    return bool(text and EVAL_PAT.search(text))
+
+
+def parse_marker_max(text: str, answer_text: str) -> int:
+    """
+    Decide MAX = 10/15/20 from user text or inferred word count.
+    """
+    t = (text or "").lower()
+    if "20" in t and "marker" in t:
+        return 20
+    if "15" in t and "marker" in t:
+        return 15
+    if "10" in t and "marker" in t:
+        return 10
+
+    # Infer from word count
+    wc = len((answer_text or "").split())
+    if wc >= 330:
+        return 20
+    if wc >= 200:
+        return 15
+    return 10
+
+
+def strip_eval_directive(text: str) -> str:
+    """
+    If a student pastes answer + writes 'Evaluate my answer ...' in same message,
+    remove the directive lines to keep only the answer body.
+    """
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.splitlines()]
+    kept = []
+    for ln in lines:
+        if EVAL_PAT.search(ln):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+
+# ---------------- OCR / PDF extraction ----------------
+def _clean_extracted_text(s: str) -> str:
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def extract_text_from_pdf(path: str, max_pages: int = 25) -> Tuple[str, str]:
+    """
+    Returns (text, mode) where mode in {"typed_pdf", "ocr_pdf"}.
+    """
+    # 1) Try typed PDF extraction
+    try:
+        chunks = []
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages[:max_pages]):
+                t = page.extract_text() or ""
+                if t.strip():
+                    chunks.append(t)
+        typed_text = _clean_extracted_text("\n\n".join(chunks))
+    except Exception:
+        typed_text = ""
+
+    # If enough text, treat as typed PDF
+    if len(typed_text.split()) >= 40:
+        return typed_text, "typed_pdf"
+
+    # 2) OCR for scanned PDFs
+    try:
+        images = convert_from_path(path, dpi=250, first_page=1, last_page=max_pages)
+        ocr_parts = []
+        for img in images:
+            # mild help for OCR
+            gray = img.convert("L")
+            ocr_parts.append(pytesseract.image_to_string(gray))
+        ocr_text = _clean_extracted_text("\n\n".join(ocr_parts))
+        return ocr_text, "ocr_pdf"
+    except Exception as e:
+        logger.exception("PDF OCR failed: %s", e)
+        return "", "ocr_pdf"
+
+
+def ocr_image_path(path: str) -> str:
+    try:
+        img = Image.open(path)
+        gray = img.convert("L")
+        txt = pytesseract.image_to_string(gray)
+        return _clean_extracted_text(txt)
+    except Exception as e:
+        logger.exception("Image OCR failed: %s", e)
+        return ""
+
+
+# ---------------- UPSC evaluation (Chat Completions, NO file_search) ----------------
+def evaluate_answer_sync(answer_text: str, marker_max: int) -> str:
+    """
+    UPSC-style evaluation, independent of faculty docs.
+    """
+    answer_text = (answer_text or "").strip()
+    if not answer_text:
+        return "⚠️ I couldn’t read any text from your answer. Please upload a clearer scan or paste typed text."
+
+    user_prompt = f"""
+Marker: {marker_max} marker (MAX = {marker_max})
+Expected length guidance:
+- 10 marker ≈ 150 words
+- 15 marker ≈ 250 words
+- 20 marker ≈ 350–400 words
+
+Now evaluate the student's answer below:
+
+--- STUDENT ANSWER START ---
+{answer_text}
+--- STUDENT ANSWER END ---
+""".strip()
+
+    # Retry loop for transient issues
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4.1",
+                messages=[
+                    {"role": "system", "content": EVAL_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+        except APIConnectionError as e:
+            logger.warning("Eval connection error attempt %s: %s", attempt + 1, e)
+            if attempt < 2:
+                continue
+            return "⚠️ OpenAI connection error. Try again."
+        except RateLimitError:
+            if attempt < 2:
+                continue
+            return "⚠️ Too many requests. Try again after 1 minute."
+        except APIStatusError as e:
+            return f"⚠️ OpenAI API error: {e}"
+        except Exception as e:
+            logger.exception("Eval error: %s", e)
+            return "Unexpected server error during evaluation. Please try again."
+
+
+async def evaluate_answer(answer_text: str, marker_max: int) -> str:
+    return await asyncio.to_thread(evaluate_answer_sync, answer_text, marker_max)
+
+
 # ---------------- Telegram Handlers ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ PastPulse AI is Live!\n"
         "Ask any GS-1 History / Indian Art & Culture question.\n\n"
         "Answer Writing:\n"
-        "Paste your answer and say: 'Evaluate my answer (10/15/20 marker)'.\n\n"
+        "1) Paste your answer OR upload PDF / photo.\n"
+        "2) Then send: 'Evaluate my answer (10/15/20 marker)'.\n\n"
         "Faculty Upload:\n"
         "/uploaddoc <ADMIN_SECRET>\n"
         "Then send PDF/DOC."
@@ -469,9 +649,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text.strip()
-    answer = await docs_only_answer(user_text)
 
-    # Send in chunks (do NOT truncate)
+    # ---- Evaluation request (text-based) ----
+    if is_evaluation_request(user_text):
+        # Case 1: Answer + directive in same message
+        possible_answer = strip_eval_directive(user_text)
+        if len(possible_answer.split()) >= 30:
+            marker_max = parse_marker_max(user_text, possible_answer)
+            out = await evaluate_answer(possible_answer, marker_max)
+            for part in split_telegram_chunks(out, limit=3900):
+                await update.message.reply_text(part)
+            return
+
+        # Case 2: Evaluate the last uploaded/pasted answer stored in user_data
+        cached = context.user_data.get("last_answer_text", "")
+        if not cached or len(cached.split()) < 10:
+            await update.message.reply_text(
+                "⚠️ I don’t have your answer text yet.\n"
+                "Please paste your answer OR upload a PDF/photo first, then send: Evaluate my answer (10/15/20 marker)."
+            )
+            return
+
+        marker_max = parse_marker_max(user_text, cached)
+        out = await evaluate_answer(cached, marker_max)
+        for part in split_telegram_chunks(out, limit=3900):
+            await update.message.reply_text(part)
+        return
+
+    # ---- Normal Q&A (docs-only) ----
+    answer = await docs_only_answer(user_text)
     for part in split_telegram_chunks(answer, limit=3900):
         await update.message.reply_text(part)
 
@@ -495,7 +701,7 @@ async def uploaddoc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["awaiting_doc_upload"] = True
-    await update.message.reply_text("✅ Now send the PDF/DOC file.")
+    await update.message.reply_text("✅ Now send the faculty PDF/DOC file to upload & index.")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,54 +709,153 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-
-    if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
-        await update.message.reply_text(
-            "❌ Upload system not configured.\n"
-            "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env vars."
-        )
-        return
-
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Only faculty can upload.")
-        return
-
-    if not context.user_data.get("awaiting_doc_upload"):
-        await update.message.reply_text("Send /uploaddoc <ADMIN_SECRET> first.")
-        return
-
     doc = update.message.document
-    file_obj = await context.bot.get_file(doc.file_id)
+    caption = (update.message.caption or "").strip()
 
     tmp_path = None
     try:
+        file_obj = await context.bot.get_file(doc.file_id)
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{doc.file_name or 'upload'}") as tmp:
             tmp_path = tmp.name
 
         await file_obj.download_to_drive(custom_path=tmp_path)
 
-        await update.message.reply_text("⏳ Uploading & indexing...")
+        # ---------- Faculty upload flow ----------
+        if context.user_data.get("awaiting_doc_upload"):
+            if not ADMIN_SECRET or not ADMIN_TELEGRAM_IDS:
+                await update.message.reply_text(
+                    "❌ Upload system not configured.\n"
+                    "Set ADMIN_SECRET and ADMIN_TELEGRAM_IDS in Render env vars."
+                )
+                return
 
-        file_id = await asyncio.to_thread(upload_and_index_doc, tmp_path)
+            if not is_admin(user_id):
+                await update.message.reply_text("❌ Only faculty can upload.")
+                return
 
-        # Reset assistant cache so new docs are immediately available in retrieval behavior
-        global _ASSISTANT_ID
-        _ASSISTANT_ID = None
+            await update.message.reply_text("⏳ Uploading & indexing faculty document...")
 
-        await update.message.reply_text(f"✅ Uploaded & indexed.\nFile ID: {file_id}")
+            file_id = await asyncio.to_thread(upload_and_index_doc, tmp_path)
+
+            # Reset assistant cache so new docs are immediately available
+            global _ASSISTANT_ID
+            _ASSISTANT_ID = None
+
+            await update.message.reply_text(f"✅ Uploaded & indexed.\nFile ID: {file_id}")
+            return
+
+        # ---------- Student submission flow ----------
+        filename = (doc.file_name or "").lower()
+
+        # PDF: extract typed text, else OCR
+        if filename.endswith(".pdf") or (doc.mime_type == "application/pdf"):
+            await update.message.reply_text("⏳ Reading your PDF (text/OCR)...")
+            text, mode = await asyncio.to_thread(extract_text_from_pdf, tmp_path)
+            context.user_data["last_answer_text"] = text
+
+            if not text or len(text.split()) < 10:
+                await update.message.reply_text(
+                    "⚠️ I couldn’t read enough text from this PDF.\n"
+                    "Tips: upload a clearer scan (straight, good light) OR paste typed text."
+                )
+                return
+
+            # If caption asks for evaluation, evaluate immediately
+            if is_evaluation_request(caption):
+                marker_max = parse_marker_max(caption, text)
+                out = await evaluate_answer(text, marker_max)
+                for part in split_telegram_chunks(out, limit=3900):
+                    await update.message.reply_text(part)
+            else:
+                await update.message.reply_text(
+                    "✅ PDF received.\nNow send: Evaluate my answer (10/15/20 marker)."
+                )
+            return
+
+        # TXT: read directly
+        if filename.endswith(".txt") or (doc.mime_type == "text/plain"):
+            await update.message.reply_text("⏳ Reading your text file...")
+            with open(tmp_path, "rb") as f:
+                raw = f.read()
+            text = raw.decode("utf-8", errors="ignore")
+            text = _clean_extracted_text(text)
+            context.user_data["last_answer_text"] = text
+
+            if is_evaluation_request(caption):
+                marker_max = parse_marker_max(caption, text)
+                out = await evaluate_answer(text, marker_max)
+                for part in split_telegram_chunks(out, limit=3900):
+                    await update.message.reply_text(part)
+            else:
+                await update.message.reply_text("✅ Answer received.\nNow send: Evaluate my answer (10/15/20 marker).")
+            return
+
+        # Unsupported docs for student evaluation (DOC/DOCX)
+        await update.message.reply_text(
+            "⚠️ For student answer evaluation, please upload:\n"
+            "- PDF (typed or scanned)\n"
+            "- Photo of written answer\n"
+            "- Or paste the answer as text\n\n"
+            "DOC/DOCX evaluation is not enabled yet."
+        )
 
     except Exception as e:
         logger.exception(e)
-        msg = str(e)
-        await update.message.reply_text(
-            "❌ Upload failed.\n"
-            f"{msg}\n\n"
-            "If this says 'no vector_stores', do: Render → Manual Deploy → Clear build cache & deploy "
-            "and ensure requirements has openai==1.56.0."
-        )
+        await update.message.reply_text("❌ File handling failed. Please try again.")
 
     finally:
-        context.user_data["awaiting_doc_upload"] = False
+        # Reset faculty upload flag if set
+        if context.user_data.get("awaiting_doc_upload"):
+            context.user_data["awaiting_doc_upload"] = False
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.photo:
+        return
+
+    caption = (update.message.caption or "").strip()
+
+    tmp_path = None
+    try:
+        # Get highest resolution photo
+        photo = update.message.photo[-1]
+        file_obj = await context.bot.get_file(photo.file_id)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix="_photo.jpg") as tmp:
+            tmp_path = tmp.name
+
+        await file_obj.download_to_drive(custom_path=tmp_path)
+
+        await update.message.reply_text("⏳ Reading your photo (OCR)...")
+        text = await asyncio.to_thread(ocr_image_path, tmp_path)
+        context.user_data["last_answer_text"] = text
+
+        if not text or len(text.split()) < 10:
+            await update.message.reply_text(
+                "⚠️ I couldn’t read enough text from this image.\n"
+                "Tips: use good light, keep page straight, dark pen, no shadows, zoom so text is clear."
+            )
+            return
+
+        if is_evaluation_request(caption):
+            marker_max = parse_marker_max(caption, text)
+            out = await evaluate_answer(text, marker_max)
+            for part in split_telegram_chunks(out, limit=3900):
+                await update.message.reply_text(part)
+        else:
+            await update.message.reply_text("✅ Image received.\nNow send: Evaluate my answer (10/15/20 marker).")
+
+    except Exception as e:
+        logger.exception(e)
+        await update.message.reply_text("❌ Photo handling failed. Please try again.")
+
+    finally:
         if tmp_path:
             try:
                 os.remove(tmp_path)
@@ -568,6 +873,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("uploaddoc", uploaddoc))
 
+    # Order matters: photos/docs before text
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
