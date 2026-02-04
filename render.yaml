@@ -1,6 +1,5 @@
 services:
   - type: worker
     name: pastpulse-telegram-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
+    env: docker
     startCommand: python main.py
