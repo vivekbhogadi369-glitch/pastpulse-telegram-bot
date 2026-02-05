@@ -54,7 +54,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # This must match EXACTLY what you want users to see when content is missing.
 REFUSAL = "Not found in faculty documents. Ask faculty to upload the relevant material."
 
-# ---------------- MERGED SYSTEM PROMPT (UPSC + Evaluation + GS-1 Boundary + Docs-Only) ----------------
+# ---------------- MERGED SYSTEM PROMPT (UPSC + GS-1 Boundary + Docs-Only) ----------------
 SYSTEM_PROMPT = f"""
 You are PastPulse AI — a strict, professional GS-1 History and Indian Art & Culture mentor for UPSC and State PSC preparation. Write in the style of an experienced UPSC examiner: crisp, analytical, syllabus-bound, and evidence-first.
 
@@ -74,10 +74,7 @@ Evidence requirement:
 1) SCOPE (STRICT GS-1 ONLY)
 ========================
 Answer ONLY if the user’s query clearly falls within GS-1:
-
-- Ancient Indian History
-- Medieval Indian History
-- Modern Indian History
+- Ancient/Medieval/Modern Indian History
 - Prescribed World History themes
 - Post-Independence history ONLY as historical processes (no current affairs)
 - Indian Art & Culture
@@ -120,25 +117,66 @@ If MAINS-style or 150/250 words:
 """.strip()
 
 # ---------------- Evaluation-only system prompt (NO DOCS) ----------------
+# FIXED: UPSC-style marking with minimum attempt marks and 0 only in true zero-cases.
 EVAL_SYSTEM_PROMPT = """
 You are a strict UPSC GS-1 examiner and mentor.
 
 You ONLY evaluate answers that belong to GS-1 History & Indian Art and Culture
 (Ancient/Medieval/Modern Indian History, prescribed World History themes, Post-Independence as historical processes, Indian Art & Culture).
-If the answer is clearly not from GS-1 History/Art & Culture, refuse:
+If the answer is clearly not from GS-1 History/Art & Culture, refuse EXACTLY:
 
 "Refusal (Out of GS-1 History/Art & Culture): I can’t evaluate this because it is not GS-1 History/Art & Culture."
 
-Evaluation format (MANDATORY):
+========================
+UPSC MARKING PRINCIPLE (NON-NEGOTIABLE)
+========================
+- DO NOT default to 0 for weak answers.
+- Give minimum marks if there is a genuine attempt (even if poor).
+- "Estimated Score: 0 / MAX" is allowed ONLY if:
+  (a) the answer is blank/near-blank, OR
+  (b) completely unrelated to GS-1 History/Art & Culture, OR
+  (c) text is meaningless/gibberish with no interpretable content.
+
+If there is any interpretable attempt on-topic, award at least:
+- 10 marker: 1 to 2 marks
+- 15 marker: 1 to 3 marks
+- 20 marker: 2 to 4 marks
+
+Score dimension-wise (UPSC style) and then total:
+1) Structure (Intro-Body-Conclusion, flow)
+2) Relevance (addresses directive + demand)
+3) Content (facts/examples/terms)
+4) Analysis (causation, significance, continuity-change, balance)
+5) Presentation (clarity, keywords, subheadings)
+
+========================
+MANDATORY OUTPUT FORMAT
+========================
 A) Overall Examiner Impression (1–2 lines)
+
 B) Estimated Score: X / MAX
    - Add: "This is an estimated, approximate score — not an official UPSC marking."
-C) What is GOOD (Strengths) (bullets)
-D) What is MISSING / WEAK (Gaps) (bullets)
-E) What is BAD (Critical faults, if any) (bullets)
-F) UPSC-Level Improvements (Actionable tips) (bullets)
-G) Value Addition (Rewrite Add-on)
-   - Provide a rewritten improved answer in UPSC style within the expected word limit for the marker.
+   - X must be realistic given the attempt.
+
+C) Marking Breakdown (dimension-wise)
+   - Structure: a/b
+   - Relevance: a/b
+   - Content: a/b
+   - Analysis: a/b
+   - Presentation: a/b
+   (Choose b values consistent with MAX; keep it simple and coherent.)
+
+D) What is GOOD (Strengths) (bullets)
+
+E) What is MISSING / WEAK (Gaps) (bullets)
+
+F) What is BAD (Critical faults, if any) (bullets)
+
+G) UPSC-Level Improvements (Actionable tips) (bullets)
+
+H) Value Addition (Rewrite Add-on)
+   - Provide an improved rewritten answer in UPSC style within the expected word limit for the marker.
+   - Keep it syllabus-bound; do not add irrelevant content.
 
 Marker mapping:
 - 10 marker ≈ 150 words
@@ -179,8 +217,6 @@ def is_admin(user_id: int) -> bool:
 
 
 # ---------------- Evaluation detection ----------------
-# Matches:
-# "Evaluate my answer", "Evaluate my answer(20 marker)", "evaluate my answer 15 marker"
 EVAL_PAT = re.compile(r"\bevaluate\s*my\s*answer\b", re.IGNORECASE)
 
 
@@ -215,6 +251,38 @@ def strip_eval_directive(text: str) -> str:
             continue
         kept.append(ln)
     return "\n".join(kept).strip()
+
+
+def looks_like_gibberish(answer_text: str) -> bool:
+    """
+    Heuristic to catch OCR garbage so we DON'T produce unfair 0 scores.
+    If text is not readable, we ask for a clearer scan instead of evaluating.
+    """
+    t = (answer_text or "").strip()
+    if not t:
+        return True
+
+    words = t.split()
+    if len(words) < 10:
+        return True
+
+    # Words that contain at least 2 letters (basic "readability")
+    readable_words = 0
+    for w in words:
+        if re.search(r"[A-Za-z].*[A-Za-z]", w):
+            readable_words += 1
+
+    readable_ratio = readable_words / max(1, len(words))
+    # Too many symbols/noise
+    non_alnum_ratio = len(re.findall(r"[^A-Za-z0-9\s]", t)) / max(1, len(t))
+
+    # If most words are not readable OR text is heavily symbol-noisy -> gibberish
+    if readable_ratio < 0.45:
+        return True
+    if non_alnum_ratio > 0.25:
+        return True
+
+    return False
 
 
 # ---------------- OCR / PDF extraction ----------------
@@ -370,13 +438,21 @@ async def docs_only_answer(user_text: str) -> str:
 # ---------------- UPSC evaluation (Chat Completions, NO file_search) ----------------
 def evaluate_answer_sync(answer_text: str, marker_max: int) -> str:
     answer_text = (answer_text or "").strip()
+
     if not answer_text or len(answer_text.split()) < 10:
         return "⚠️ I couldn’t read enough text from your answer. Upload a clearer scan/photo OR paste typed text."
+
+    # NEW: If OCR is garbage, don't unfairly score 0 — ask for clearer input.
+    if looks_like_gibberish(answer_text):
+        return (
+            "⚠️ The extracted text looks unclear/garbled (OCR noise), so a fair UPSC-style evaluation isn’t possible.\n"
+            "Please upload a clearer scan/photo (straight page, good light, dark pen, no shadows) OR paste typed text."
+        )
 
     user_prompt = f"""
 Marker: {marker_max} marker (MAX = {marker_max})
 
-Now evaluate the student's answer below:
+Now evaluate the student's answer below. Apply UPSC marking principle: do NOT give 0 if there is a genuine attempt.
 
 --- STUDENT ANSWER START ---
 {answer_text}
@@ -459,6 +535,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for part in split_telegram_chunks(out):
             await update.message.reply_text(part)
         return
+
+    # If user pasted a long answer (without saying evaluate), cache it for later evaluation
+    # (optional quality-of-life; doesn't change behavior for normal questions)
+    if len(raw_text.split()) >= 80 and not raw_text.lower().startswith("/"):
+        context.user_data["last_answer_text"] = raw_text
 
     # ---- Normal docs-only Q&A ----
     answer = await docs_only_answer(raw_text)
